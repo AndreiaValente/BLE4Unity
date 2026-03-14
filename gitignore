@@ -1,0 +1,30 @@
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.log
+*.tlog
+*.lastbuildstate
+*.idb
+*.pch
+*.ipch
+packages/
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+
+# Build output
+*.exp
+*.lib
+
+# OS
+.DS_Store
+Thumbs.db
