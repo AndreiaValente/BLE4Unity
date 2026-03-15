@@ -195,12 +195,28 @@ IAsyncOperation<GattDeviceService> retrieveService(wchar_t* deviceId, wchar_t* s
 	auto device = co_await retrieveDevice(deviceId);
 	if (device == nullptr)
 		co_return nullptr;
+
+	// Check cache — but validate the cached object is still alive
 	{
 		lock_guard lock(cacheLock);
-		if (cache[hsh(deviceId)].services.count(hsh(serviceId)))
-			co_return cache[hsh(deviceId)].services[hsh(serviceId)].service;
+		if (cache[hsh(deviceId)].services.count(hsh(serviceId))) {
+			auto& cached = cache[hsh(deviceId)].services[hsh(serviceId)].service;
+			if (cached != nullptr) {
+				// Test if the service object is still valid by accessing a property
+				try {
+					auto _ = cached.Uuid();
+					co_return cached;
+				}
+				catch (...) {
+					// Stale/closed object — evict from cache and re-fetch
+					cache[hsh(deviceId)].services.erase(hsh(serviceId));
+				}
+			}
+		}
 	}
-	GattDeviceServicesResult result = co_await device.GetGattServicesForUuidAsync(make_guid(serviceId), BluetoothCacheMode::Cached);
+
+	// Fetch fresh — use Uncached to force a real GATT query (Cached can return stale refs)
+	GattDeviceServicesResult result = co_await device.GetGattServicesForUuidAsync(make_guid(serviceId), BluetoothCacheMode::Uncached);
 	if (result.Status() != GattCommunicationStatus::Success) {
 		saveError(L"%s:%d Failed retrieving services.", __WFILE__, __LINE__);
 		co_return nullptr;
@@ -221,12 +237,27 @@ IAsyncOperation<GattCharacteristic> retrieveCharacteristic(wchar_t* deviceId, wc
 	auto service = co_await retrieveService(deviceId, serviceId);
 	if (service == nullptr)
 		co_return nullptr;
+
+	// Check cache — validate the cached characteristic is still alive
 	{
 		lock_guard lock(cacheLock);
-		if (cache[hsh(deviceId)].services[hsh(serviceId)].characteristics.count(hsh(characteristicId)))
-			co_return cache[hsh(deviceId)].services[hsh(serviceId)].characteristics[hsh(characteristicId)].characteristic;
+		if (cache[hsh(deviceId)].services[hsh(serviceId)].characteristics.count(hsh(characteristicId))) {
+			auto& cached = cache[hsh(deviceId)].services[hsh(serviceId)].characteristics[hsh(characteristicId)].characteristic;
+			if (cached != nullptr) {
+				try {
+					auto _ = cached.Uuid();
+					co_return cached;
+				}
+				catch (...) {
+					// Stale/closed — evict and re-fetch
+					cache[hsh(deviceId)].services[hsh(serviceId)].characteristics.erase(hsh(characteristicId));
+				}
+			}
+		}
 	}
-	GattCharacteristicsResult result = co_await service.GetCharacteristicsForUuidAsync(make_guid(characteristicId), BluetoothCacheMode::Cached);
+
+	// Fetch fresh — use Uncached
+	GattCharacteristicsResult result = co_await service.GetCharacteristicsForUuidAsync(make_guid(characteristicId), BluetoothCacheMode::Uncached);
 	if (result.Status() != GattCommunicationStatus::Success) {
 		saveError(L"%s:%d Error scanning characteristics from service %s with status %d", __WFILE__, __LINE__, serviceId, result.Status());
 		co_return nullptr;
@@ -636,13 +667,24 @@ bool PollData(BLEData* data, bool block) {
 // ============================================================================
 
 fire_and_forget SendDataAsync(BLEData data, condition_variable* signal, bool* result) {
+	bool shouldRetry = false;
+
 	try {
 		auto characteristic = co_await retrieveCharacteristic(data.deviceId, data.serviceUuid, data.characteristicUuid);
 		if (characteristic != nullptr) {
 			DataWriter writer;
 			writer.WriteBytes(array_view<uint8_t const>(data.buf, data.buf + data.size));
 			IBuffer buffer = writer.DetachBuffer();
-			auto status = co_await characteristic.WriteValueAsync(buffer, GattWriteOption::WriteWithoutResponse);
+
+			// Check characteristic properties to pick the correct write mode.
+			// PMD Control on Polar H10 uses Write (with response), not WriteWithoutResponse.
+			auto props = characteristic.CharacteristicProperties();
+			GattWriteOption writeOpt = GattWriteOption::WriteWithoutResponse;
+			if ((props & GattCharacteristicProperties::Write) == GattCharacteristicProperties::Write) {
+				writeOpt = GattWriteOption::WriteWithResponse;
+			}
+
+			auto status = co_await characteristic.WriteValueAsync(buffer, writeOpt);
 			if (status != GattCommunicationStatus::Success)
 				saveError(L"%s:%d Error writing value to characteristic with uuid %s", __WFILE__, __LINE__, data.characteristicUuid);
 			else if (result != 0)
@@ -651,8 +693,58 @@ fire_and_forget SendDataAsync(BLEData data, condition_variable* signal, bool* re
 	}
 	catch (hresult_error& ex)
 	{
-		saveError(L"%s:%d SendDataAsync catch: %s", __WFILE__, __LINE__, ex.message().c_str());
+		// If we get "object has been closed", flag for retry after evicting stale cache.
+		// co_await cannot be used inside a catch block, so we defer the retry.
+		if (ex.code() == 0x80000013 /* RO_E_CLOSED */) {
+			saveError(L"%s:%d SendDataAsync: object closed, will evict cache and retry for %s", __WFILE__, __LINE__, data.characteristicUuid);
+			{
+				lock_guard lock(cacheLock);
+				auto devIt = cache.find(hsh(data.deviceId));
+				if (devIt != cache.end()) {
+					auto svcIt = devIt->second.services.find(hsh(data.serviceUuid));
+					if (svcIt != devIt->second.services.end()) {
+						svcIt->second.characteristics.erase(hsh(data.characteristicUuid));
+						devIt->second.services.erase(hsh(data.serviceUuid));
+					}
+				}
+			}
+			shouldRetry = true;
+		}
+		else {
+			saveError(L"%s:%d SendDataAsync catch: %s", __WFILE__, __LINE__, ex.message().c_str());
+		}
 	}
+
+	// Retry outside the catch block
+	if (shouldRetry) {
+		try {
+			auto characteristic = co_await retrieveCharacteristic(data.deviceId, data.serviceUuid, data.characteristicUuid);
+			if (characteristic != nullptr) {
+				DataWriter writer2;
+				writer2.WriteBytes(array_view<uint8_t const>(data.buf, data.buf + data.size));
+				IBuffer buffer2 = writer2.DetachBuffer();
+
+				auto props = characteristic.CharacteristicProperties();
+				GattWriteOption writeOpt = GattWriteOption::WriteWithoutResponse;
+				if ((props & GattCharacteristicProperties::Write) == GattCharacteristicProperties::Write) {
+					writeOpt = GattWriteOption::WriteWithResponse;
+				}
+
+				auto status = co_await characteristic.WriteValueAsync(buffer2, writeOpt);
+				if (status != GattCommunicationStatus::Success)
+					saveError(L"%s:%d Error writing (retry) to characteristic with uuid %s", __WFILE__, __LINE__, data.characteristicUuid);
+				else {
+					clearError();
+					if (result != 0)
+						*result = true;
+				}
+			}
+		}
+		catch (hresult_error& ex2) {
+			saveError(L"%s:%d SendDataAsync retry catch: %s", __WFILE__, __LINE__, ex2.message().c_str());
+		}
+	}
+
 	if (signal != 0)
 		signal->notify_one();
 }

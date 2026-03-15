@@ -65,7 +65,7 @@ public static class BLE4Unity
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct ErrorMessage
     {
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 1024)]
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 2048)]
         public string msg;
     }
 
@@ -191,13 +191,48 @@ public static class BLE4Unity
     public static extern void GetError(ref ErrorMessage buf);
 
     // =========================================================================
-    // Helper
+    // Helpers
     // =========================================================================
 
+    /// <summary>
+    /// Retrieves the last error message from the DLL.
+    /// </summary>
     public static string GetLastError()
     {
         var err = new ErrorMessage();
         GetError(ref err);
         return err.msg;
+    }
+
+    /// <summary>
+    /// Non-blocking PollData that returns a nullable BLEData.
+    /// Returns null if no data is available.
+    /// </summary>
+    public static BLEData? Poll()
+    {
+        var data = new BLEData();
+        bool result = PollData(ref data, false);
+        if (result && data.size > 0)
+            return data;
+        return null;
+    }
+
+    /// <summary>
+    /// Build a BLEData packet and write it to a characteristic.
+    /// </summary>
+    public static bool Write(string deviceId, string serviceUuid, string charUuid, byte[] data, bool block)
+    {
+        if (data == null || data.Length > 512)
+            return false;
+
+        var pkg = new BLEData();
+        pkg.buf = new byte[512];
+        Array.Copy(data, pkg.buf, data.Length);
+        pkg.size = (ushort)data.Length;
+        pkg.deviceId = deviceId;
+        pkg.serviceUuid = serviceUuid;
+        pkg.characteristicUuid = charUuid;
+
+        return SendData(ref pkg, block);
     }
 }
