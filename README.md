@@ -145,6 +145,31 @@ All DLL functions can be called from any thread. For the polling pattern (`PollD
 
 The `DeviceDisconnectedCallback` fires on a WinRT background thread. Do not call Unity API from it directly.
 
+### GATT service caching
+
+When you call `SubscribeCharacteristic`, `SendData`, or `ReadCharacteristic`, the DLL internally looks up the service and characteristic on the device. For previously paired or well-known devices (like a Polar H10), this lookup works immediately because Windows keeps their GATT tables cached.
+
+For custom or unpaired BLE peripherals (like an ESP32), the lookup can fail with "No service found" because Windows hasn't discovered the device's services yet. To fix this, call `ScanServices` and wait for it to finish **before** subscribing. This forces a full GATT discovery that populates the DLL's internal cache:
+
+```csharp
+// On a background thread:
+
+// 1. Discover services (populates the cache)
+BLE4Unity.ScanServices(deviceId);
+var service = new BLE4Unity.Service();
+while (BLE4Unity.PollService(ref service, true) != BLE4Unity.ScanStatus.FINISHED) { }
+
+// 2. Optionally discover characteristics
+BLE4Unity.ScanCharacteristics(deviceId, serviceUuid);
+var chr = new BLE4Unity.Characteristic();
+while (BLE4Unity.PollCharacteristic(ref chr, true) != BLE4Unity.ScanStatus.FINISHED) { }
+
+// 3. Now subscribe — the service/characteristic are cached and will be found
+bool ok = BLE4Unity.SubscribeCharacteristic(deviceId, serviceUuid, charUuid, true);
+```
+
+All three steps should run on the **same background thread** to avoid race conditions with the DLL's internal WinRT coroutines.
+
 ## API reference
 
 | Function | Description |

@@ -427,18 +427,39 @@ void StopDeviceScan() {
 // ============================================================================
 
 fire_and_forget ScanServicesAsync(wchar_t* deviceId) {
+	// Copy deviceId to a local buffer immediately — the P/Invoke marshalling
+	// layer may unpin the managed string after the first co_await, leaving
+	// the original pointer dangling.
+	wchar_t localDeviceId[256];
+	wcscpy_s(localDeviceId, sizeof(localDeviceId) / sizeof(wchar_t), deviceId);
+
 	{
 		lock_guard queueGuard(serviceQueueLock);
 		serviceScanFinished = false;
 	}
 	try {
-		auto bluetoothLeDevice = co_await retrieveDevice(deviceId);
+		auto bluetoothLeDevice = co_await retrieveDevice(localDeviceId);
 		if (bluetoothLeDevice != nullptr) {
 			GattDeviceServicesResult result = co_await bluetoothLeDevice.GetGattServicesAsync(BluetoothCacheMode::Uncached);
 			if (result.Status() == GattCommunicationStatus::Success) {
 				IVectorView<GattDeviceService> services = result.Services();
+				long devHash = hsh(localDeviceId);
 				for (auto&& service : services)
 				{
+					// Cache each discovered service so retrieveService() can find it
+					// without calling GetGattServicesForUuidAsync (which can fail if
+					// this coroutine still holds references to the service objects).
+					{
+						lock_guard lock(cacheLock);
+						auto svcUuidStr = to_hstring(service.Uuid());
+						wchar_t svcUuidBuf[100];
+						wcscpy_s(svcUuidBuf, sizeof(svcUuidBuf) / sizeof(wchar_t), svcUuidStr.c_str());
+						long svcHash = hsh(svcUuidBuf);
+						if (!cache[devHash].services.count(svcHash)) {
+							cache[devHash].services[svcHash] = { service };
+						}
+					}
+
 					Service serviceStruct;
 					wcscpy_s(serviceStruct.uuid, sizeof(serviceStruct.uuid) / sizeof(wchar_t), to_hstring(service.Uuid()).c_str());
 					{
@@ -495,19 +516,39 @@ ScanStatus PollService(Service* service, bool block) {
 // ============================================================================
 
 fire_and_forget ScanCharacteristicsAsync(wchar_t* deviceId, wchar_t* serviceId) {
+	// Copy params before any co_await — P/Invoke may unpin managed strings
+	wchar_t localDeviceId[256];
+	wchar_t localServiceId[100];
+	wcscpy_s(localDeviceId, sizeof(localDeviceId) / sizeof(wchar_t), deviceId);
+	wcscpy_s(localServiceId, sizeof(localServiceId) / sizeof(wchar_t), serviceId);
+
 	{
 		lock_guard lock(characteristicQueueLock);
 		characteristicScanFinished = false;
 	}
 	try {
-		auto service = co_await retrieveService(deviceId, serviceId);
+		auto service = co_await retrieveService(localDeviceId, localServiceId);
 		if (service != nullptr) {
 			GattCharacteristicsResult charScan = co_await service.GetCharacteristicsAsync(BluetoothCacheMode::Uncached);
 			if (charScan.Status() != GattCommunicationStatus::Success)
-				saveError(L"%s:%d Error scanning characteristics from service %s width status %d", __WFILE__, __LINE__, serviceId, (int)charScan.Status());
+				saveError(L"%s:%d Error scanning characteristics from service %s width status %d", __WFILE__, __LINE__, localServiceId, (int)charScan.Status());
 			else {
+				long devHash = hsh(localDeviceId);
+				long svcHash = hsh(localServiceId);
 				for (auto c : charScan.Characteristics())
 				{
+					// Cache the characteristic so retrieveCharacteristic() can find it
+					{
+						lock_guard lock(cacheLock);
+						auto chrUuidStr = to_hstring(c.Uuid());
+						wchar_t chrUuidBuf[100];
+						wcscpy_s(chrUuidBuf, sizeof(chrUuidBuf) / sizeof(wchar_t), chrUuidStr.c_str());
+						long chrHash = hsh(chrUuidBuf);
+						if (!cache[devHash].services[svcHash].characteristics.count(chrHash)) {
+							cache[devHash].services[svcHash].characteristics[chrHash] = { c };
+						}
+					}
+
 					Characteristic charStruct;
 					wcscpy_s(charStruct.uuid, sizeof(charStruct.uuid) / sizeof(wchar_t), to_hstring(c.Uuid()).c_str());
 					// retrieve user description
